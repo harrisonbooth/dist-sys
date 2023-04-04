@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"log"
-	"math"
 	"sync"
 	"time"
 
@@ -52,6 +51,49 @@ func (m *ReadMessages) keys() []int64 {
 	return m.messages
 }
 
+type SentMessages struct {
+	messages map[int64][]string
+	mut      sync.RWMutex
+}
+
+func (m *SentMessages) update(message int64, dest string) {
+	m.mut.Lock()
+	defer m.mut.Unlock()
+	m.messages[message] = append(m.messages[message], dest)
+}
+
+func (m *SentMessages) hasSucceeded(message int64, dest string) bool {
+	m.mut.RLock()
+	defer m.mut.RUnlock()
+	if m.messages[message] == nil {
+		return false
+	}
+	return slices.Contains(m.messages[message], dest)
+}
+
+func (m *SentMessages) checkUnsent(message int64, topology []string) []string {
+	m.mut.RLock()
+	defer m.mut.RUnlock()
+	unsent := make([]string, 0)
+
+	if len(m.messages[message]) == len(topology) {
+		return unsent
+	}
+
+	for _, node := range topology {
+		if !m.hasSucceeded(message, node) {
+			unsent = append(unsent, node)
+		}
+	}
+	return unsent
+}
+
+func NewSentMessages() SentMessages {
+	return SentMessages{
+		messages: make(map[int64][]string),
+	}
+}
+
 func createReadResponse(messages []int64) ReadResponse {
 	return ReadResponse{
 		Type:     "read_ok",
@@ -60,9 +102,11 @@ func createReadResponse(messages []int64) ReadResponse {
 }
 
 func main() {
+	var wg sync.WaitGroup
 	n := maelstrom.NewNode()
-	messages_read := NewReadMessages()
-	topology := make(map[string][]string)
+	readMessages := NewReadMessages()
+	sentMessages := NewSentMessages()
+	topology := make([]string, 0)
 
 	n.Handle("echo", func(msg maelstrom.Message) error {
 		// Unmarshal the message body as an loosely-typed map.
@@ -85,7 +129,7 @@ func main() {
 			return err
 		}
 
-		topology = body.Topology
+		topology = body.Topology[n.ID()]
 
 		topology_response := make(map[string]string)
 		topology_response["type"] = "topology_ok"
@@ -93,11 +137,24 @@ func main() {
 	})
 
 	n.Handle("broadcast_ok", func(msg maelstrom.Message) error {
+		var body BroadcastRequest
+
+		if err := json.Unmarshal(msg.Body, &body); err != nil {
+			return err
+		}
+
+		log.Printf("Before update %v | %v", body.Message, msg.Dest)
+		sentMessages.update(body.Message, msg.Dest) // this is deadlocking
+		log.Printf("After update %v | %v", body.Message, msg.Dest)
+
+		log.Printf("body.Message=%v msg.Dest=%v msg.Body=%v msg.Src=%v", body.Message, msg.Dest, string(msg.Body), msg.Src)
+
 		return nil
 	})
 
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
-		broadcast_response := make(map[string]string)
+
+		broadcast_response := make(map[string]any)
 		broadcast_response["type"] = "broadcast_ok"
 
 		var body BroadcastRequest
@@ -106,38 +163,46 @@ func main() {
 			return err
 		}
 
-		if messages_read.contains(body.Message) {
+		if readMessages.contains(body.Message) {
 			return n.Reply(msg, broadcast_response)
 		}
+		readMessages.update(body.Message)
 
-		messages_read.update(body.Message)
+		if slices.Contains(topology, msg.Src) {
+			sentMessages.update(body.Message, msg.Src)
+		}
 
-		for _, dest := range topology[n.ID()] {
-			dest := dest
-			go func() {
-				succeeded := false
-				var delay int64 = 120
-				for !succeeded {
-					n.RPC(dest, body, func(msg maelstrom.Message) error {
-						succeeded = true
-						return nil
-					})
-					delay = int64(math.Min(float64(delay), 3000))
-					time.Sleep(time.Duration(delay * 1000))
-					delay = delay * 2
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for len(sentMessages.checkUnsent(body.Message, topology)) > 0 {
+				for _, node := range sentMessages.checkUnsent(body.Message, topology) {
+					n.Send(node, body)
 				}
-			}()
+				time.Sleep(time.Second)
+			}
+		}()
+
+		if msg.Src[0] == 'n' {
+			broadcast_response["message"] = body.Message
 		}
 
 		return n.Reply(msg, broadcast_response)
 	})
 
 	n.Handle("read", func(msg maelstrom.Message) error {
-		body := createReadResponse(messages_read.keys())
+		body := createReadResponse(readMessages.keys())
 		return n.Reply(msg, body)
 	})
 
-	if err := n.Run(); err != nil {
-		log.Fatal(err)
-	}
+	var wg2 sync.WaitGroup
+	wg2.Add(1)
+	go func() {
+		defer wg2.Done()
+		wg.Wait()
+		if err := n.Run(); err != nil {
+			log.Fatal(err)
+		}
+	}()
+	wg2.Wait()
 }
