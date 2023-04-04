@@ -27,7 +27,7 @@ type ReadResponse struct {
 
 type ReadMessages struct {
 	messages []int64
-	m        sync.RWMutex
+	mut      sync.RWMutex
 }
 
 func NewReadMessages() ReadMessages {
@@ -37,14 +37,14 @@ func NewReadMessages() ReadMessages {
 }
 
 func (m *ReadMessages) contains(target int64) bool {
-	m.m.RLock()
-	defer m.m.RUnlock()
+	m.mut.RLock()
+	defer m.mut.RUnlock()
 	return slices.Contains(m.messages, target)
 }
 
 func (m *ReadMessages) update(message int64) {
-	m.m.Lock()
-	defer m.m.Unlock()
+	m.mut.Lock()
+	defer m.mut.Unlock()
 	m.messages = append(m.messages, message)
 }
 
