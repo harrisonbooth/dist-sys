@@ -2,14 +2,13 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"math"
-	"strconv"
+	"sync"
 	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
-	cmap "github.com/orcaman/concurrent-map/v2"
+	"golang.org/x/exp/slices"
 )
 
 type TopologyRequest struct {
@@ -27,45 +26,42 @@ type ReadResponse struct {
 }
 
 type ReadMessages struct {
-	messages cmap.ConcurrentMap[string, bool]
+	messages []int64
+	m        sync.RWMutex
 }
 
-func (m *ReadMessages) contains(target string) bool {
-	_, ok := m.messages.Get(target)
-	return ok
-}
-
-func (m *ReadMessages) acknowledge(message string) {
-	m.messages.Set(message, true)
-}
-
-func (m *ReadMessages) keys() []string {
-	keys := make([]string, 0)
-	for entry := range m.messages.IterBuffered() {
-		keys = append(keys, entry.Key)
+func NewReadMessages() ReadMessages {
+	return ReadMessages{
+		messages: make([]int64, 0),
 	}
-	return keys
 }
 
-func createReadResponse(messages []string) ReadResponse {
-	int_messages := make([]int64, 0)
-	for _, message := range messages {
-		if int_message, err := strconv.Atoi(message); err != nil {
-			int_messages = append(int_messages, int64(int_message))
-		}
-	}
+func (m *ReadMessages) contains(target int64) bool {
+	m.m.RLock()
+	defer m.m.RUnlock()
+	return slices.Contains(m.messages, target)
+}
 
+func (m *ReadMessages) update(message int64) {
+	m.m.Lock()
+	defer m.m.Unlock()
+	m.messages = append(m.messages, message)
+}
+
+func (m *ReadMessages) keys() []int64 {
+	return m.messages
+}
+
+func createReadResponse(messages []int64) ReadResponse {
 	return ReadResponse{
 		Type:     "read_ok",
-		Messages: int_messages,
+		Messages: messages,
 	}
 }
 
 func main() {
 	n := maelstrom.NewNode()
-	messages_read := ReadMessages{
-		messages: cmap.New[bool](),
-	}
+	messages_read := NewReadMessages()
 	topology := make(map[string][]string)
 
 	n.Handle("echo", func(msg maelstrom.Message) error {
@@ -110,11 +106,11 @@ func main() {
 			return err
 		}
 
-		if messages_read.contains(fmt.Sprint(body.Message)) {
+		if messages_read.contains(body.Message) {
 			return n.Reply(msg, broadcast_response)
 		}
 
-		messages_read.acknowledge(fmt.Sprint(body.Message))
+		messages_read.update(body.Message)
 
 		for _, dest := range topology[n.ID()] {
 			dest := dest
